@@ -21,6 +21,12 @@ REASON_OUTSIDE_PERIOD = "OUTSIDE_VALID_PERIOD"
 # 覆盖检测时间的当前校准版本结论为未通过
 REASON_NOT_PASSED = "CALIBRATION_NOT_PASSED"
 
+# 排班查询输入错误（沿用 422 + 机器可读原因码的既有错误约定）
+REASON_EMPTY_INSTRUMENTS = "EMPTY_INSTRUMENTS"
+REASON_DUPLICATE_INSTRUMENT = "DUPLICATE_INSTRUMENT"
+REASON_INVALID_TIME_RANGE = "INVALID_TIME_RANGE"
+REASON_NAIVE_DATETIME = "TIMEZONE_REQUIRED"
+
 # 会话级咨询锁命名空间（int4）：同仪器的“禁用变更 / 发布”共用一把锁。
 # 键为 (ADVISORY_LOCK_NS, hashtext(instrument))，hashtext 由数据库计算
 # （见 app.db.instrument_lock_key，在事务外取键）。
@@ -530,3 +536,163 @@ def affected_reports(conn, instrument: str | None) -> list[dict[str, Any]]:
             },
         })
     return items
+
+
+# ---- 排班查询：整组仪器何时都具备放行条件 --------------------------------------
+
+def instrument_availability_timeline(conn, instruments: list[str],
+                                     range_from: datetime,
+                                     range_to: datetime) -> dict[str, Any]:
+    """在同一已提交状态快照上切分查询范围，逐段给出整组是否可放行。
+
+    判定规则与单报告放行完全一致：未撤销禁用区间优先（左闭右开，命中即
+    ``INSTRUMENT_DISABLED`` 并给出禁用依据）；未命中禁用时按**当前**校准
+    版本判定（``PASSED_CALIBRATION_COVERAGE`` / ``CALIBRATION_NOT_PASSED``
+    / ``OUTSIDE_VALID_PERIOD`` / ``NO_CALIBRATION``，后两类给不出依据
+    版本/事件）。调用方须在 SERIALIZABLE 只读事务中调用本函数，故整组
+    仪器依据同一已提交状态，不会与并发的更正/登记/撤销混用前后状态。
+
+    所有禁用与校准边界（裁剪到查询范围后）并入切点集合；开放终点统一截在
+    查询终点。相邻时段仅在“整组结论 + 各仪器原因码与依据”均相同时合并。
+    """
+    qfrom, qto = range_from, range_to
+    # 同一事务内一次性取齐全部仪器的当前校准与未撤销禁用区间，
+    # 后续切分计算都基于这两份同一快照的数据。
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT * FROM calibration_versions WHERE is_current = TRUE "
+            "AND instrument = ANY(%s)",
+            (instruments,),
+        )
+        cal_rows = cur.fetchall()
+        cur.execute(
+            "SELECT * FROM instrument_disable_events WHERE revoked = FALSE "
+            "AND instrument = ANY(%s)",
+            (instruments,),
+        )
+        dis_rows = cur.fetchall()
+
+    by_instrument: dict[str, dict[str, list[dict[str, Any]]]] = {
+        inst: {"cals": [], "disables": []} for inst in instruments
+    }
+    for row in cal_rows:
+        by_instrument[row["instrument"]]["cals"].append(row)
+    for row in dis_rows:
+        by_instrument[row["instrument"]]["disables"].append(row)
+
+    boundaries: set[datetime] = {qfrom, qto}
+
+    def clip_intervals(rows, f_key: str, t_key: str) -> None:
+        for r in rows:
+            f, t = r[f_key], r[t_key]
+            if qfrom < f < qto:
+                boundaries.add(f)
+            if t is not None and qfrom < t < qto:
+                boundaries.add(t)
+            # 区间终点为空（开放区间）时，开放终点截在查询终点 qto（已在集合中）
+
+    for inst in instruments:
+        data = by_instrument[inst]
+        clip_intervals(data["cals"], "valid_from", "valid_to")
+        clip_intervals(data["disables"], "disabled_from", "disabled_to")
+
+    cuts = sorted(boundaries)
+
+    def covering(rows, at: datetime, f_key: str, t_key: str):
+        """左闭右开命中：valid/disabled_from <= at < to（to 为空表示开放）。"""
+        for r in rows:
+            if r[f_key] <= at and (r[t_key] is None or at < r[t_key]):
+                return r
+        return None
+
+    def state_at(inst: str, at: datetime) -> dict[str, Any]:
+        """单仪器在时点 at（左闭右开区间内）的结论；依据键用于合并判定。"""
+        data = by_instrument[inst]
+        disable = covering(data["disables"], at, "disabled_from", "disabled_to")
+        if disable is not None:
+            return {
+                "instrument": inst,
+                "releasable": False,
+                "reason_code": REASON_DISABLED,
+                "basis_disable": disable_brief(disable),
+                "basis_calibration": None,
+                "_key": ("disable", disable["id"]),
+            }
+        cal = covering(data["cals"], at, "valid_from", "valid_to")
+        if cal is not None:
+            if cal["passed"]:
+                return {
+                    "instrument": inst,
+                    "releasable": True,
+                    "reason_code": REASON_PASSED,
+                    "basis_disable": None,
+                    "basis_calibration": _cal_brief(cal),
+                    "_key": ("cal", cal["id"]),
+                }
+            return {
+                "instrument": inst,
+                "releasable": False,
+                "reason_code": REASON_NOT_PASSED,
+                "basis_disable": None,
+                "basis_calibration": _cal_brief(cal),
+                "_key": ("cal", cal["id"]),
+            }
+        reason = (REASON_NO_CALIBRATION if not data["cals"]
+                  else REASON_OUTSIDE_PERIOD)
+        return {
+            "instrument": inst,
+            "releasable": False,
+            "reason_code": reason,
+            "basis_disable": None,
+            "basis_calibration": None,
+            "_key": (reason, None),
+        }
+
+    def signature(states: list[dict[str, Any]], all_release: bool):
+        # 各仪器依据均相同 = 原因码与所据禁用事件/校准版本（_key）全部相同
+        return (all_release, tuple((s["reason_code"], s["_key"]) for s in states))
+
+    segments: list[dict[str, Any]] = []
+
+    def push(seg_from: datetime, seg_to: datetime,
+             states: list[dict[str, Any]], all_release: bool) -> None:
+        sig = signature(states, all_release)
+        if segments and segments[-1]["_sig"] == sig:
+            # 仅相邻且整组结论、各仪器原因码与依据均相同：延长上一时段
+            segments[-1]["to"] = seg_to
+            return
+        segments.append({
+            "from": seg_from,
+            "to": seg_to,
+            "all_releasable": all_release,
+            "instruments": [
+                {k: v for k, v in s.items() if not k.startswith("_")}
+                for s in states
+            ],
+            "_sig": sig,
+        })
+
+    for i in range(len(cuts) - 1):
+        seg_from, seg_to = cuts[i], cuts[i + 1]
+        # 左闭右开：用时段起点（任一覆盖区间均覆盖整个时段）判定
+        states = [state_at(inst, seg_from) for inst in instruments]
+        push(seg_from, seg_to, states, all(s["releasable"] for s in states))
+
+    return {
+        "query": {
+            "instruments": instruments,
+            "from": qfrom.isoformat(),
+            "to": qto.isoformat(),
+        },
+        "segments": [
+            {
+                "from": s["from"].isoformat(),
+                "to": s["to"].isoformat(),
+                "all_releasable": s["all_releasable"],
+                "instruments": s["instruments"],
+            }
+            for s in segments
+        ],
+        "count": len(segments),
+        "planning_only": True,
+    }

@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI
 
 from .db import close_pool, open_pool
-from .routers import calibrations, disables, reports
+from .routers import calibrations, disables, reports, scheduling
 
 
 @asynccontextmanager
@@ -20,7 +20,7 @@ async def lifespan(app: FastAPI):
 
 app = FastAPI(
     title="实验室检测报告放行 API",
-    version="1.1.0",
+    version="1.2.0",
     description=(
         "校准记录版本化管理、仪器禁用区间与检测报告放行判定。\n\n"
         "- 校准区间左闭右开 [valid_from, valid_to)，同仪器当前版本区间不得重叠\n"
@@ -28,6 +28,7 @@ app = FastAPI(
         "- 仪器可按唯一事件号登记禁用区间（左闭右开，终点可空），可撤销、记录保留\n"
         "- 报告检测时间命中未撤销禁用区间即拒绝放行并返回禁用依据，即使校准通过\n"
         "- 报告仅在未禁用且被“通过”校准覆盖时发布，并保存判定快照\n"
+        "- 可按整组仪器查询时间范围内何时全部可放行（仅供规划，不预占资格）\n"
         "- 所有写事务运行在 SERIALIZABLE 隔离级别，冲突自动重试"
     ),
     lifespan=lifespan,
@@ -36,6 +37,7 @@ app = FastAPI(
 app.include_router(calibrations.router)
 app.include_router(disables.router)
 app.include_router(reports.router)
+app.include_router(scheduling.router)
 
 
 @app.get("/health", tags=["system"])

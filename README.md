@@ -22,6 +22,10 @@
 - 已发布报告的快照**永不改写**；更正校准后可按当前有效性重算，列出结论与快照不同的报告。
 - 可按**当前禁用状态**查询受影响的已发布报告及对应禁用依据；追溯登记或撤销禁用后结果随之变化，
   但原放行记录与快照不改写。
+- **排班可用性查询（本轮新增）**：给定一组仪器与带时区的时间范围，按当前未撤销禁用区间
+  （优先）与当前校准版本，把范围切分成左闭右开时段，逐段返回整组是否可放行及各仪器原因码、
+  所据禁用事件/校准版本；仅在整组结论与各仪器依据均相同时合并相邻时段。结果**仅供规划**、
+  不预占未来放行资格，整次查询依据同一已提交状态（只读 SERIALIZABLE）。
 - 禁用变更、校准更正与报告发布事务均运行在 **SERIALIZABLE** 隔离级别并对冲突自动重试，
   配合唯一部分索引、GiST 排他约束与行锁，杜绝“双最新版”、“禁用区间重叠”和
   “在已生效禁用区间内误放行”。
@@ -103,6 +107,12 @@ uvicorn app.main:app --reload
 | GET | `/disables?instrument=&include_revoked=` | 禁用事件列表（默认含已撤销，供追溯） |
 | GET | `/disables/{event_no}` | 按事件号查看单条禁用事件（含已撤销） |
 | GET | `/disables/affected-reports?instrument=` | 当前受禁用影响的已发布报告及禁用依据 |
+
+### 排班可用性（本轮新增）
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| POST | `/scheduling/availability` | 切分时间范围，逐段返回整组是否可放行及各仪器原因码/依据 |
 
 ## 调用示例
 
@@ -329,10 +339,92 @@ curl -sS 'http://localhost:8000/disables/affected-reports?instrument=HPLC-01'
 }
 ```
 
+### 9. 排班可用性查询（整组仪器何时都能放行）
+
+查询一组仪器在指定时间范围内何时**全部**具备报告放行条件。服务端按“当前未撤销禁用区间优先、
+当前校准版本覆盖且通过”的既有放行规则，对查询范围切分并返回**按时间排序的左闭右开时段**。
+
+```bash
+curl -sS -X POST http://localhost:8000/scheduling/availability \
+  -H 'Content-Type: application/json' \
+  -d '{
+        "instruments": ["HPLC-01", "GC-02", "MS-03"],
+        "from": "2026-01-01T00:00:00Z",
+        "to":   "2026-09-01T00:00:00Z"
+      }'
+```
+
+请求体：
+
+- `instruments`：仪器标识列表，**非空且无重复**（按原始标识判定，不做 trim）；
+- `from` / `to`：查询范围**起点（含）/终点（不含）**，必须**带时区偏移**（`Z` 或 `+08:00`，
+  服务端统一换算到 UTC）；要求 `from < to`。
+
+响应（节选）：每个时段给出 `from`/`to`、`all_releasable`（整组是否都可放行）以及按入参顺序
+排列的各仪器结论 `instruments[]`：`releasable`、`reason_code`、所据 `basis_disable` /
+`basis_calibration`（无依据时为 `null`）。
+
+```json
+{
+  "query": {"instruments": ["HPLC-01", "GC-02", "MS-03"],
+            "from": "2026-01-01T00:00:00+00:00", "to": "2026-09-01T00:00:00+00:00"},
+  "segments": [
+    {
+      "from": "2026-01-01T00:00:00+00:00",
+      "to":   "2026-03-01T00:00:00+00:00",
+      "all_releasable": false,
+      "instruments": [
+        {"instrument": "HPLC-01", "releasable": true,
+         "reason_code": "PASSED_CALIBRATION_COVERAGE",
+         "basis_disable": null,
+         "basis_calibration": {"id": 1, "version": 1, "passed": true, "...": "..."}},
+        {"instrument": "GC-02", "releasable": true,
+         "reason_code": "PASSED_CALIBRATION_COVERAGE",
+         "basis_disable": null, "basis_calibration": {"...": "..."}},
+        {"instrument": "MS-03", "releasable": false,
+         "reason_code": "NO_CALIBRATION",
+         "basis_disable": null, "basis_calibration": null}
+      ]
+    },
+    {"from": "2026-03-01T00:00:00+00:00", "to": "2026-04-01T00:00:00+00:00",
+     "all_releasable": false, "instruments": [ "...HPLC-01 命中 INSTRUMENT_DISABLED，给出 basis_disable..." ]}
+  ],
+  "count": 6,
+  "planning_only": true
+}
+```
+
+切分与合并语义：
+
+- **禁用优先**：任一时点命中未撤销禁用区间即为 `INSTRUMENT_DISABLED` 并给出禁用事件依据，
+  即使该仪器校准通过；未命中时再按当前校准判定
+  （`PASSED_CALIBRATION_COVERAGE` / `CALIBRATION_NOT_PASSED` /
+  `OUTSIDE_VALID_PERIOD` / `NO_CALIBRATION`）。
+- **切点 = 查询首尾 + 各禁用/校准区间边界（裁剪到查询范围内）**；区间均为左闭右开，
+  恰为终点不命中；开放区间（终点 `null`）的开放终点统一**截在查询终点**。
+- **相邻合并**：仅当整组结论（`all_releasable`）与各仪器原因码及所据禁用事件/校准版本
+  **全部相同**才合并；原因码相同但依据版本不同（如两条首尾相接的“通过”校准）仍在边界切开；
+  首尾两段即使同名也不跨中间段合并。
+- **无当前校准的仪器**在每段都显示 `NO_CALIBRATION`，其他仪器可放行不会把它掩盖——
+  因此只要有一台仪器不可放行，`all_releasable` 即为 `false`。
+
+输入错误（均为 `422`，`detail.code` 机器可读）：
+
+- `EMPTY_INSTRUMENTS`：列表为空或含空串标识；
+- `DUPLICATE_INSTRUMENT`：标识重复（`detail.duplicates` 列出重复值）；
+- `TIMEZONE_REQUIRED`：`from`/`to` 未带时区偏移（不静默按 UTC 补）；
+- `INVALID_TIME_RANGE`：`from >= to`。
+
+> 该接口为**只读**：`planning_only=true` 表示结果仅供规划，**不预占未来放行资格**、
+> 不写任何数据；正式报告仍以提交 `POST /reports` 时的已提交状态判定。整次查询在**同一个
+> SERIALIZABLE 只读事务**内取齐全部仪器的禁用与校准状态，依据同一已提交快照，与并发的
+> 校准更正、禁用登记/撤销不会混用前后状态。既有的报告提交与错误约定保持不变。
+
 ### 脚本化完整演示
 
 ```bash
 bash examples/curl-demo.sh                     # curl 版全流程（含禁用登记/撤销）
+bash examples/curl-scheduling.sh               # 本轮新增：排班可用性查询
 BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与禁用流程的 Python 版
 ```
 
@@ -359,3 +451,7 @@ BASE_URL=http://localhost:8000 python3 examples/demo.py   # 含并发更正与�
    未知事件 `404`、重复撤销 `409 DISABLE_ALREADY_REVOKED`。
 6. **追溯一致**：受影响报告查询为 SERIALIZABLE 只读事务，按当前未撤销禁用区间实时计算，
    不物化、不改写报告与快照；登记/撤销的结果对之后的查询立即可见。
+7. **排班查询整段快照一致**：`/scheduling/availability` 在单个 SERIALIZABLE 只读事务内
+   一次性取齐整组仪器的当前校准与未撤销禁用区间，再做切分；与并发的更正、禁用登记/撤销
+   冲突时按 SERIALIZABLE 语义读到的必然是某一个已提交状态（必要时事务重试），
+   绝不会在同一次结果里混用前后状态。只读、不预占、不改写任何数据。

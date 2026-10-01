@@ -58,6 +58,42 @@ class DisableRevoke(BaseModel):
     reason: str | None = Field(None, description="撤销原因（可选）")
 
 
+class AvailabilityQuery(BaseModel):
+    """整组仪器排班可用性查询：非空且无重复仪器标识 + 带时区的起止时间。
+
+    列表非空/去重、起点早于终点由接口层校验为机器可读原因码；
+    缺少时区在这里直接抛 422 TIMEZONE_REQUIRED，不静默按 UTC 补。
+    """
+
+    instruments: list[str] = Field(
+        ...,
+        description="仪器标识列表；必须非空且无重复（由接口层校验，返回机器可读原因码）",
+    )
+    range_from: datetime = Field(
+        ..., alias="from",
+        description="查询范围起点（含），必须带时区偏移，且早于终点",
+    )
+    range_to: datetime = Field(
+        ..., alias="to",
+        description="查询范围终点（不含），必须带时区偏移",
+    )
+
+    model_config = {"populate_by_name": True}
+
+    @field_validator("range_from", "range_to")
+    @classmethod
+    def _require_timezone(cls, v: datetime) -> datetime:
+        if v.tzinfo is None or v.tzinfo.utcoffset(v) is None:
+            from fastapi import HTTPException
+
+            # 与既有错误约定保持一致：422 + detail.code 机器可读
+            raise HTTPException(status_code=422, detail={
+                "code": "TIMEZONE_REQUIRED",
+                "message": "查询时间必须显式带时区偏移（如 2026-03-01T00:00:00+08:00 或 Z）",
+            })
+        return v.astimezone(timezone.utc)
+
+
 def serialize_disable(row: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": row["id"],
